@@ -1,139 +1,101 @@
 # Translytic
 
-Translytic is a Python desktop application that turns a video into translated captions and plays the video back with synced subtitles. It can also generate a dubbed audio track from the translated text and export the translated captions as an `.srt` file.
-
-The app is built with Tkinter, OpenCV, pygame, Whisper, MoviePy, deep-translator, edge-tts, and pydub.
+Translytic is a Python desktop application that transcribes video speech, translates captions, plays the video with synchronized subtitles, and can generate translated dubbed audio.
 
 ## Features
 
-- Modern Tkinter desktop UI with drag-and-drop video loading
-- Video preview and fullscreen-friendly playback area
-- Audio extraction from video files
+- Video loading through a file picker or drag and drop
 - Speech transcription using OpenAI Whisper
-- Caption confidence logging for Whisper segments
-- Translation to English, Hindi, Marathi, Spanish, French, German, Japanese, Chinese, Arabic, and Portuguese
+- Automatic CPU/CUDA selection when PyTorch supports it
+- Translation to English, Hindi, Marathi, Spanish, French, German, Japanese, Simplified Chinese, Arabic, and Portuguese
 - Google Translate fallback through `deep-translator`
-- Optional OpenAI-powered natural translation if an API key is added in `app.py`
-- Synced live captions during playback
-- Original audio / dubbed audio toggle
-- Dubbed audio generation using edge-tts
-- Subtitle export in `.srt` format
-- Keyboard shortcuts for play/pause and seeking
-- Automatic cleanup of temporary audio files
-
-## Supported Video Formats
-
-The file picker and drag-and-drop loader accept:
-
-- `.mp4`
-- `.mov`
-- `.avi`
-- `.mkv`
-- `.webm`
+- Optional OpenRouter translation configured through environment variables or a local `.env` file
+- Synced caption playback, seeking, and original/dubbed audio switching
+- SRT subtitle export
+- Translation failure warnings; failed segments retain source text in captions and are skipped by TTS
 
 ## Requirements
 
-- Python 3.11.9
-- FFmpeg and FFprobe installed and available in PATH
-- Internet connection for Google Translate and edge-tts
-- Enough disk space for temporary extracted audio files
+- Python 3.11.x recommended for this dependency set
+- FFmpeg and FFprobe installed and available on `PATH`
+- Internet access for online translation and Edge TTS
+- Enough temporary disk space for extracted audio and dubbed output
+- NVIDIA GPU and a compatible CUDA-enabled PyTorch build for GPU acceleration (optional)
 
-Whisper can run on CPU, but transcription may be slow for long videos.
+Whisper can run on CPU, but processing long videos may be slow.
 
-## Installation
+## Install on Windows
 
-Clone the repository:
+Clone the repository and enter the project directory:
 
 ```powershell
 git clone https://github.com/Soham-1009/Translytic.git
 cd Translytic
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-Create and activate a virtual environment:
+If PowerShell blocks activation, activate the environment using a permitted execution policy or run `.venv\Scripts\python.exe` directly.
 
-```powershell
-python -m venv venv
-venv\Scripts\activate
-```
-
-Install dependencies:
-
-```powershell
-pip install pygame opencv-python Pillow openai-whisper deep-translator moviepy tkinterdnd2 openai edge-tts pydub
-```
-
-If you have an NVIDIA GPU and want Whisper to use GPU acceleration, install the CUDA-enabled PyTorch build inside the activated virtual environment:
-
-```powershell
-pip uninstall torch torchvision torchaudio -y
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
-
-Check whether PyTorch can see your GPU:
-
-```powershell
-python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
-```
-
-Install FFmpeg and make sure both `ffmpeg` and `ffprobe` work from the terminal:
+Install FFmpeg separately and confirm both tools are available:
 
 ```powershell
 ffmpeg -version
 ffprobe -version
 ```
 
-## Usage
+For GPU acceleration, install a PyTorch build compatible with your NVIDIA driver using the official PyTorch installation selector. Then verify the result:
 
-Run the app:
+```powershell
+python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU mode')"
+```
+
+## Configure optional OpenRouter translation
+
+Create a key at [OpenRouter API Keys](https://openrouter.ai/settings/keys). The project includes a `.env` file with a placeholder. Replace it with your own key:
+
+```env
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+OPENROUTER_MODEL=openrouter/free
+```
+
+`openrouter/free` is OpenRouter's free-model router. It automatically selects an available free model, so the exact model may vary. Free endpoints can be rate-limited or temporarily unavailable. If you prefer a specific model, choose a currently available model marked free in the [OpenRouter model catalog](https://openrouter.ai/models?max_price=0) and set its exact model ID in `OPENROUTER_MODEL`. Avoid paid model IDs if you need to keep inference free.
+
+The app loads `.env` at startup. The `.env` file is ignored by Git; do not commit your real key. If no OpenRouter key is configured, Translytic uses Google Translate. If an OpenRouter request fails, the app attempts the Google Translate fallback. If both providers fail for a segment, the source text is retained and a warning is written to the processing log. Dubbed audio skips segments explicitly marked as translation failures.
+
+## Run
 
 ```powershell
 python app.py
 ```
 
-Basic workflow:
-
-1. Click **Browse** or drag a video file into the app.
+1. Select or drop a video with an audio track.
 2. Select the target language.
 3. Click **Process & Play**.
-4. Wait for audio extraction, transcription, translation, and dubbed audio generation.
-5. Preview the video with translated captions.
-6. Use **Original / Dubbed** to switch audio mode when dubbed audio is available.
-7. Click **Export .srt** to save translated subtitles.
+4. Wait while audio is extracted, transcribed, translated, and dubbed.
+5. Review the captions and playback.
+6. Use **Export .srt** to save translated captions.
 
-## Controls
+Supported extensions in the UI include MP4, MOV, AVI, MKV, and WebM. Actual codec support depends on the FFmpeg/OpenCV installation.
 
-- Click the video area to play or pause.
-- Use the playback buttons to play, pause, and stop.
-- Use the seek bar to jump through the video.
-- Press `Space` to play or pause.
-- Press `Left Arrow` to seek backward 5 seconds.
-- Press `Right Arrow` to seek forward 5 seconds.
+## Tests
 
-## How It Works
+The subtitle utility tests do not require Whisper, a GUI, or network access:
 
-1. MoviePy extracts the source audio into a temporary WAV file.
-2. Whisper transcribes the audio into timestamped text segments.
-3. Each segment is translated into the selected language.
-4. edge-tts creates translated speech clips for each segment.
-5. pydub overlays the generated speech clips onto a silent audio track.
-6. OpenCV decodes video frames in a background thread.
-7. pygame plays either the original extracted audio or the generated dubbed audio.
-8. Tkinter displays the video frames, captions, progress, and logs.
-
-## Optional OpenAI Translation
-
-By default, the app uses `deep-translator` with Google Translate. The code also supports OpenAI translation if you set this variable in `app.py`:
-
-```python
-OPENAI_API_KEY = "your-api-key"
+```powershell
+python -m unittest discover -s tests -v
 ```
 
-If OpenAI translation fails, the app falls back to Google Translate automatically.
+## Known limitations
 
-## Notes
+- Translation and voice synthesis require network access.
+- Machine translation may need manual review for idioms, names, and technical vocabulary.
+- Dubbed speech length can differ from the original dialogue timing.
+- A full visual subtitle editor, speaker diarization, resumable processing, and additional subtitle formats are not yet implemented.
+- Python dependency versions are not pinned; for a reproducible release, test and lock versions on the target Windows/Python environment.
 
-- The app auto-installs missing Python packages when it starts, but installing them manually is recommended.
-- FFmpeg and FFprobe are required. The app exits with an error message if either tool is not found.
-- Videos without audio cannot be processed.
-- Temporary files are created in the system temp folder and cleaned up when the app closes.
-- Do not commit `venv/`, generated audio, cache files, or large videos to GitHub.
+## Temporary files and privacy
+
+Temporary audio files created by the current application instance are tracked and cleaned up on shutdown. Translytic no longer deletes every file matching a broad pattern in the shared system temporary directory. Do not commit API keys, `.env`, virtual environments, media files, or generated audio.

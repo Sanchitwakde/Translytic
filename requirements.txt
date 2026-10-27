@@ -1,0 +1,12 @@
+# Install on Python 3.11.x. FFmpeg/FFprobe are external system dependencies.
+pygame
+opencv-python
+Pillow
+openai-whisper
+deep-translator
+moviepy>=2.0
+tkinterdnd2
+openai
+edge-tts
+pydub
+python-dotenv

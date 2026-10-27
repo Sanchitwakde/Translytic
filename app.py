@@ -7,13 +7,12 @@ from tkinter import filedialog, messagebox, ttk
 import threading
 import time
 import os
-import glob
-import subprocess
 import sys
 import warnings
 import logging
 import shutil
 import tempfile
+import importlib.util
 import queue
 
 warnings.filterwarnings("ignore")
@@ -29,25 +28,30 @@ except Exception:
     except Exception:
         pass
 
-# ── Auto-install missing packages ───────────────────────────
-REQUIRED_PACKAGES = [
-    ("pygame",          "pygame"),
-    ("opencv-python",   "cv2"),
-    ("Pillow",          "PIL"),
-    ("openai-whisper",  "whisper"),
-    ("deep-translator", "deep_translator"),
-    ("moviepy",         "moviepy"),
-    ("tkinterdnd2",     "tkinterdnd2"),
-    ("openai",          "openai"),
-    ("edge-tts",        "edge_tts"),
-    ("pydub",           "pydub"),
-]
-for pkg, imp in REQUIRED_PACKAGES:
-    try:
-        __import__(imp)
-    except ImportError:
-        print(f"Installing {pkg}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+# ── Dependency check (never install packages silently at startup) ──
+REQUIRED_IMPORTS = {
+    "pygame": "pygame",
+    "opencv-python": "cv2",
+    "Pillow": "PIL",
+    "openai-whisper": "whisper",
+    "deep-translator": "deep_translator",
+    "moviepy": "moviepy",
+    "tkinterdnd2": "tkinterdnd2",
+    "edge-tts": "edge_tts",
+    "pydub": "pydub",
+    "python-dotenv": "dotenv",
+    "torch": "torch",
+}
+_missing = [package for package, module in REQUIRED_IMPORTS.items()
+            if importlib.util.find_spec(module) is None]
+if _missing:
+    raise SystemExit(
+        "Translytic is missing required Python packages: " + ", ".join(_missing) +
+        "\nActivate your virtual environment and run: pip install -r requirements.txt"
+    )
+
+from dotenv import load_dotenv
+load_dotenv()  # Reads an optional local .env file; never commit that file.
 
 import pygame
 import cv2
@@ -59,6 +63,7 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 import edge_tts
 import asyncio
 from pydub import AudioSegment
+from subtitle_utils import format_time, to_srt, get_caption_at
 
 # ── FFmpeg availability check ────────────────────────────────
 def ensure_ffmpeg_available():
@@ -75,8 +80,10 @@ def ensure_ffmpeg_available():
     _root.destroy()
     sys.exit(1)
 
-# ── Optional OpenAI key for natural translations ─────────────
-OPENAI_API_KEY = ""
+# ── Optional OpenRouter configuration for AI translations ────
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip() or "openrouter/free"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # ── Colour palette ───────────────────────────────────────────
 BG          = "#06060e"
@@ -228,64 +235,91 @@ def transcribe(audio_path):
     return segments
 
 def translate_segments(segments, lang_code, lang_name, check_cancel=None):
-    out = []
-    if OPENAI_API_KEY:
+    """Translate segments and retain explicit failure metadata for failed lines.
+
+    OpenRouter is optional and uses the OpenAI-compatible chat completions API.
+    When it is unavailable or a request fails, Google Translate is attempted per
+    segment. If both fail, the source text is retained and marked as failed.
+    """
+    client = None
+    if OPENROUTER_API_KEY:
         try:
             from openai import OpenAI
-            client = OpenAI(api_key=OPENAI_API_KEY)
-            for seg in segments:
-                if check_cancel and check_cancel():
-                    raise InterruptedError("Cancelled")
-                prompt = (f"Translate the following English text to casual, everyday, "
-                          f"spoken {lang_name}. Keep it natural. Text: {seg['text']}")
-                resp = client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3,
-                )
-                out.append({"start": seg["start"], "end": seg["end"],
-                            "text": resp.choices[0].message.content.strip()})
-            return out
-        except InterruptedError:
-            raise
-        except Exception as e:
-            print("OpenAI failed, falling back to Google Translate:", e)
+            client = OpenAI(
+                api_key=OPENROUTER_API_KEY,
+                base_url=OPENROUTER_BASE_URL,
+                timeout=45.0,
+                max_retries=1,
+                default_headers={"X-Title": "Translytic"},
+            )
+        except Exception as exc:
+            print(f"OpenRouter translation is unavailable; using Google Translate: {exc}")
 
+    out = []
     for seg in segments:
         if check_cancel and check_cancel():
             raise InterruptedError("Cancelled")
-        try:
-            txt = GoogleTranslator(source="auto", target=lang_code).translate(seg["text"])
-        except Exception:
-            txt = seg["text"]
-        out.append({"start": seg["start"], "end": seg["end"], "text": txt.strip()})
+
+        source_text = str(seg.get("text", "")).strip()
+        translated_text = ""
+        translation_failed = False
+        translation_error = ""
+
+        if source_text and client is not None:
+            try:
+                prompt = (
+                    f"Translate the following spoken text into natural, conversational "
+                    f"{lang_name}. The source language may be different from the target. "
+                    "Preserve names and meaning; return only the translation.\n\n"
+                    f"Text: {source_text}"
+                )
+                response = client.chat.completions.create(
+                    model=OPENROUTER_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                )
+                translated_text = (response.choices[0].message.content or "").strip()
+            except Exception as exc:
+                print(f"OpenRouter translation failed for a segment; trying Google Translate: {exc}")
+                # Avoid repeatedly making failing API calls on every remaining segment.
+                client = None
+
+        if source_text and not translated_text:
+            try:
+                translated_text = GoogleTranslator(
+                    source="auto", target=lang_code
+                ).translate(source_text) or ""
+                translated_text = translated_text.strip()
+            except Exception as exc:
+                translation_error = str(exc)
+                print(f"Google Translate failed for a segment: {exc}")
+
+        if source_text and not translated_text:
+            translated_text = source_text
+            translation_failed = True
+            if not translation_error:
+                translation_error = "No translation was returned by the configured providers."
+
+        out.append({
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": translated_text,
+            "translation_failed": translation_failed,
+            "translation_error": translation_error,
+        })
     return out
-
-def format_time(s):
-    h, rem = divmod(int(s), 3600)
-    m, sec = divmod(rem, 60)
-    ms = int((s - int(s)) * 1000)
-    return f"{h:02}:{m:02}:{sec:02},{ms:03}"
-
-def to_srt(segments):
-    out = ""
-    for i, s in enumerate(segments):
-        out += f"{i+1}\n{format_time(s['start'])} --> {format_time(s['end'])}\n{s['text']}\n\n"
-    return out
-
-def get_caption_at(segments, t):
-    for s in segments:
-        if s["start"] <= t <= s["end"]:
-            return s["text"]
-    return ""
 
 
 def remove_file_silent(path):
-    if path and os.path.exists(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    """Delete a file quietly and report whether it is gone."""
+    if not path or not os.path.exists(path):
+        return True
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        # A worker may still have the file open on Windows; shutdown cleanup retries.
+        return False
 
 
 # ── Edge-TTS voice mapping ───────────────────────────────────
@@ -332,6 +366,9 @@ def generate_tts_audio(segments, lang_code, duration, out_path, check_cancel=Non
         if check_cancel and check_cancel():
             raise InterruptedError("Cancelled")
 
+        # Avoid speaking source-language text as if it were a successful translation.
+        if seg.get("translation_failed"):
+            continue
         text = seg["text"].strip()
         if not text:
             continue
@@ -411,6 +448,10 @@ class CaptionApp:
         self._decode_thread     = None
         self._decode_stop       = threading.Event()
         self._frame_image_id    = None     # reusable canvas image item id
+        self._closing           = False
+        self._owned_temp_files  = set()
+        self._temp_files_lock   = threading.Lock()
+        self._process_thread    = None
 
         pygame.mixer.pre_init(44100, -16, 2, 1024)
         pygame.mixer.init()
@@ -659,8 +700,48 @@ class CaptionApp:
             troughcolor=SURFACE3, background=ACCENT, darkcolor=ACCENT,
             lightcolor=ACCENT2, bordercolor=SURFACE3)
 
+    def _schedule_ui(self, delay_ms, callback):
+        """Schedule UI work safely when a background worker is still finishing."""
+        if self._closing:
+            return None
+
+        def safe_callback():
+            if self._closing:
+                return
+            try:
+                callback()
+            except tk.TclError:
+                # The window may be shutting down while a worker completes.
+                pass
+
+        try:
+            return self.root.after(delay_ms, safe_callback)
+        except tk.TclError:
+            return None
+
+    def _track_temp_file(self, path):
+        if path:
+            with self._temp_files_lock:
+                self._owned_temp_files.add(path)
+        return path
+
+    def _delete_owned_temp_file(self, path):
+        if not path:
+            return
+        deleted = remove_file_silent(path)
+        if deleted:
+            with self._temp_files_lock:
+                self._owned_temp_files.discard(path)
+
+    def _cleanup_owned_temp_files(self):
+        # Keep paths whose deletion failed so a worker can retry after releasing a file.
+        with self._temp_files_lock:
+            paths = list(self._owned_temp_files)
+        for path in paths:
+            self._delete_owned_temp_file(path)
+
     def _log(self, msg):
-        self.root.after(0, lambda m=msg: self._append_log(m))
+        self._schedule_ui(0, lambda m=msg: self._append_log(m))
 
     def _append_log(self, msg):
         self.log_box.config(state="normal")
@@ -669,15 +750,15 @@ class CaptionApp:
         self.log_box.config(state="disabled")
 
     def _set_status(self, msg, color=TEXT_MUTED):
-        self.root.after(0, lambda: self.status_lbl.config(text=f"● {msg}", fg=color))
+        self._schedule_ui(0, lambda: self.status_lbl.config(text=f"● {msg}", fg=color))
 
     def _set_prog(self, msg):
-        self.root.after(0, lambda: self.prog_lbl.config(text=msg))
+        self._schedule_ui(0, lambda: self.prog_lbl.config(text=msg))
 
     def _busy_start(self):
         self._busy = True
         self._cancel_processing = False
-        self.root.after(0, lambda: [
+        self._schedule_ui(0, lambda: [
             self.proc_btn.pack_forget(),
             self.cancel_btn.pack(side="left"),
             self.progressbar.start(10),
@@ -685,7 +766,7 @@ class CaptionApp:
 
     def _busy_stop(self):
         self._busy = False
-        self.root.after(0, lambda: [
+        self._schedule_ui(0, lambda: [
             self.cancel_btn.pack_forget(),
             self.proc_btn.pack(side="left"),
             self.progressbar.stop(),
@@ -883,8 +964,8 @@ class CaptionApp:
     def _load_video_file(self, path):
         self._stop()
         self._release_cap()
-        remove_file_silent(self._audio_path)
-        remove_file_silent(self._tts_audio_path)
+        self._delete_owned_temp_file(self._audio_path)
+        self._delete_owned_temp_file(self._tts_audio_path)
         self._audio_path = None
 
         self.video_path      = path
@@ -911,8 +992,8 @@ class CaptionApp:
         self._stop()
         self._release_cap()
         
-        remove_file_silent(self._audio_path)
-        remove_file_silent(self._tts_audio_path)
+        self._delete_owned_temp_file(self._audio_path)
+        self._delete_owned_temp_file(self._tts_audio_path)
         self._audio_path = None
         self._tts_audio_path = None
         self._use_tts = False
@@ -955,8 +1036,8 @@ class CaptionApp:
         lang_code = LANGUAGES.get(lang_name, "en")
 
         self._stop()
-        remove_file_silent(self._audio_path)
-        remove_file_silent(self._tts_audio_path)
+        self._delete_owned_temp_file(self._audio_path)
+        self._delete_owned_temp_file(self._tts_audio_path)
         self._audio_path = None
         self._tts_audio_path = None
         self.segments = []
@@ -965,32 +1046,35 @@ class CaptionApp:
         self.tts_btn.config(text="🔊  Original", fg=ACCENT2, state="disabled")
 
         self._busy_start()
-        threading.Thread(
+        self._process_thread = threading.Thread(
             target=self._process,
             args=(video_path, lang_name, lang_code),
+            name="TranslyticProcessing",
             daemon=True,
-        ).start()
+        )
+        self._process_thread.start()
 
     def _process(self, video_path, lang_name, lang_code):
         # Use tempfile for safer cleanup on crash
         audio_fd, audio_path = tempfile.mkstemp(suffix=".wav", prefix="translytic_audio_")
         os.close(audio_fd)
+        self._track_temp_file(audio_path)
         tts_path = None
 
         def check_cancel():
             return self._cancel_processing
 
         def reset_partial_outputs():
-            remove_file_silent(audio_path)
-            remove_file_silent(tts_path)
+            self._delete_owned_temp_file(audio_path)
+            self._delete_owned_temp_file(tts_path)
+            self._delete_owned_temp_file(self._tts_audio_path)
             if self._audio_path == audio_path:
                 self._audio_path = None
-            if self._tts_audio_path == tts_path:
-                self._tts_audio_path = None
+            self._tts_audio_path = None
             self.segments = []
             self._use_tts = False
             self._duration = 0.0
-            self.root.after(0, lambda: self.tts_btn.config(
+            self._schedule_ui(0, lambda: self.tts_btn.config(
                 text="🔊  Original", fg=ACCENT2, state="disabled"))
 
         try:
@@ -1031,6 +1115,12 @@ class CaptionApp:
             self._set_prog("Step 3 / 4")
             self._log(f"Step 3/4 — Translating {len(raw)} segments → {lang_name}…")
             translated_segments = translate_segments(raw, lang_code, lang_name, check_cancel)
+            failed_translations = sum(1 for seg in translated_segments if seg.get("translation_failed"))
+            if failed_translations:
+                self._log(
+                    f"WARNING: translation failed for {failed_translations} segment(s). "
+                    "Their original text is retained in captions; dubbed speech skips those segments."
+                )
 
             self._audio_path = audio
             self.segments = translated_segments
@@ -1039,7 +1129,7 @@ class CaptionApp:
             if n == 0:
                 self._set_status("Ready — no captions found", WARN)
                 self._log("No speech captions were detected. Playback was not started.")
-                self.root.after(0, lambda: [
+                self._schedule_ui(0, lambda: [
                     self.seekbar.config(to=self._duration),
                     self._show_thumbnail(),
                 ])
@@ -1051,6 +1141,7 @@ class CaptionApp:
             self._log(f"Step 4/4 — Generating {lang_name} dubbed audio…")
             tts_fd, tts_path = tempfile.mkstemp(suffix=".wav", prefix="translytic_tts_")
             os.close(tts_fd)
+            self._track_temp_file(tts_path)
             try:
                 generate_tts_audio(
                     translated_segments, lang_code,
@@ -1059,23 +1150,23 @@ class CaptionApp:
                 self._tts_audio_path = tts_path
                 tts_path = None
                 self._log(f"✓  Dubbed audio ready.")
-                self.root.after(0, lambda: self.tts_btn.config(
+                self._schedule_ui(0, lambda: self.tts_btn.config(
                     text="🔊  Original", fg=ACCENT2, state="normal"))
             except InterruptedError:
                 raise
             except Exception as e:
                 self._log(f"TTS generation failed (captions still work): {e}")
-                remove_file_silent(tts_path)
+                self._delete_owned_temp_file(tts_path)
                 tts_path = None
                 self._tts_audio_path = None
                 self._use_tts = False
-                self.root.after(0, lambda: self.tts_btn.config(
+                self._schedule_ui(0, lambda: self.tts_btn.config(
                     text="🔊  Original", fg=ACCENT2, state="disabled"))
 
             self._set_status(f"Ready — {n} captions", SUCCESS)
             self._log(f"✓  Done! {n} captions ready. Playing…")
 
-            self.root.after(0, lambda: [
+            self._schedule_ui(0, lambda: [
                 self.seekbar.config(to=self._duration),
                 self._play(),
             ])
@@ -1088,10 +1179,12 @@ class CaptionApp:
             reset_partial_outputs()
             err = str(e)
             self._log(f"ERROR: {err}")
-            self.root.after(0, lambda: messagebox.showerror("Error", err))
+            self._schedule_ui(0, lambda: messagebox.showerror("Error", err))
             self._set_status("Failed", ERROR)
         finally:
             self._busy_stop()
+            if self._closing:
+                self._cleanup_owned_temp_files()
 
     def _toggle_play_pause(self):
         if self._playing:
@@ -1377,18 +1470,27 @@ class CaptionApp:
             messagebox.showinfo("Saved", f"SRT saved to:\n{path}")
 
     def _on_close(self):
+        if self._closing:
+            return
+        self._closing = True
         self._cancel_processing = True
-        self._stop()
-        self._release_cap()
-        pygame.mixer.quit()
-        time.sleep(0.1)
-        remove_file_silent(self._audio_path)
-        remove_file_silent(self._tts_audio_path)
-        # Clean up tempfile-generated files in system temp dir
-        tmp_dir = tempfile.gettempdir()
-        for pattern in ["translytic_audio_*.wav", "translytic_tts_*.wav", "translytic_tts_seg_*.mp3"]:
-            for f in glob.glob(os.path.join(tmp_dir, pattern)):
-                remove_file_silent(f)
+        try:
+            self._stop()
+        except Exception:
+            pass
+        try:
+            self._release_cap()
+        except Exception:
+            pass
+        try:
+            pygame.mixer.quit()
+        except Exception:
+            pass
+        self._delete_owned_temp_file(self._audio_path)
+        self._delete_owned_temp_file(self._tts_audio_path)
+        self._audio_path = None
+        self._tts_audio_path = None
+        self._cleanup_owned_temp_files()
         self.root.destroy()
 
 
@@ -1396,13 +1498,6 @@ class CaptionApp:
 
 if __name__ == "__main__":
     ensure_ffmpeg_available()
-
-    # Clean up leftover temp files from previous runs
-    tmp_dir = tempfile.gettempdir()
-    for pattern in ["translytic_audio_*.wav", "translytic_tts_*.wav", "translytic_tts_seg_*.mp3"]:
-        for f in glob.glob(os.path.join(tmp_dir, pattern)):
-            remove_file_silent(f)
-
     root = TkinterDnD.Tk()
     root.option_add("*tearOff", False)
     app = CaptionApp(root)
