@@ -36,4 +36,6 @@ def get_caption_at(segments, timestamp):
     for segment in segments:
         if segment["start"] <= t <= segment["end"]:
             return segment.get("text", "")
+        if segment["start"] > t:
+            break
     return ""

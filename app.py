@@ -14,9 +14,9 @@ import shutil
 import tempfile
 import importlib.util
 import queue
+import subprocess
 
 warnings.filterwarnings("ignore")
-logging.getLogger("moviepy").setLevel(logging.ERROR)
 
 # ── DPI Awareness Fix (Windows) ─────────────────────────────
 try:
@@ -35,7 +35,6 @@ REQUIRED_IMPORTS = {
     "Pillow": "PIL",
     "openai-whisper": "whisper",
     "deep-translator": "deep_translator",
-    "moviepy": "moviepy",
     "tkinterdnd2": "tkinterdnd2",
     "edge-tts": "edge_tts",
     "pydub": "pydub",
@@ -58,7 +57,6 @@ import cv2
 from PIL import Image, ImageTk, ImageDraw
 import whisper
 from deep_translator import GoogleTranslator
-from moviepy import VideoFileClip
 from tkinterdnd2 import DND_FILES, TkinterDnD
 import edge_tts
 import asyncio
@@ -69,15 +67,21 @@ from subtitle_utils import format_time, to_srt, get_caption_at
 def ensure_ffmpeg_available():
     if shutil.which("ffmpeg") and shutil.which("ffprobe"):
         return
-    import tkinter as _tk
-    _root = _tk.Tk()
-    _root.withdraw()
-    messagebox.showerror("FFmpeg Required",
+    msg = (
         "FFmpeg or FFprobe is not installed or not found in PATH.\n\n"
-        "pydub and moviepy both require FFmpeg to work.\n"
+        "Audio processing and extraction require FFmpeg to work.\n"
         "Download it from: https://ffmpeg.org/download.html\n"
-        "and make sure it is added to your system PATH.")
-    _root.destroy()
+        "and make sure it is added to your system PATH."
+    )
+    print(f"Error: {msg}", file=sys.stderr)
+    try:
+        import tkinter as _tk
+        _root = _tk.Tk()
+        _root.withdraw()
+        messagebox.showerror("FFmpeg Required", msg)
+        _root.destroy()
+    except Exception:
+        pass
     sys.exit(1)
 
 # ── Optional OpenRouter configuration for AI translations ────
@@ -142,25 +146,6 @@ def hex_to_rgb(h):
     h = h.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
-def lerp_color(c1, c2, t):
-    r = int(c1[0] + (c2[0] - c1[0]) * t)
-    g = int(c1[1] + (c2[1] - c1[1]) * t)
-    b = int(c1[2] + (c2[2] - c1[2]) * t)
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-def draw_gradient_h(canvas, w, h, c1, c2):
-    r1, r2 = hex_to_rgb(c1), hex_to_rgb(c2)
-    steps = max(w, 1)
-    for i in range(steps):
-        col = lerp_color(r1, r2, i / steps)
-        canvas.create_line(i, 0, i, h, fill=col)
-
-def draw_gradient_v(canvas, w, h, c1, c2):
-    r1, r2 = hex_to_rgb(c1), hex_to_rgb(c2)
-    for i in range(h):
-        col = lerp_color(r1, r2, i / max(h - 1, 1))
-        canvas.create_line(0, i, w, i, fill=col)
-
 def make_gradient_image(w, h, c1, c2, direction="vertical"):
     img = Image.new("RGB", (max(w, 1), max(h, 1)))
     draw = ImageDraw.Draw(img)
@@ -203,13 +188,15 @@ class GradientFrame(tk.Canvas):
 # ── Utility functions ────────────────────────────────────────
 
 def extract_audio(video_path, out="audio_temp.wav"):
-    clip = VideoFileClip(video_path)
-    try:
-        if clip.audio is None:
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", out
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        if "does not contain any stream" in res.stderr or "Output file does not contain any stream" in res.stderr:
             raise ValueError("This video does not have an audio track.")
-        clip.audio.write_audiofile(out, logger=None)
-    finally:
-        clip.close()
+        raise RuntimeError(f"FFmpeg audio extraction failed: {res.stderr.strip()[-200:]}")
     return out
 
 _whisper_model = None
@@ -242,6 +229,7 @@ def translate_segments(segments, lang_code, lang_name, check_cancel=None):
     segment. If both fail, the source text is retained and marked as failed.
     """
     client = None
+    openrouter_errors = 0
     if OPENROUTER_API_KEY:
         try:
             from openai import OpenAI
@@ -279,10 +267,13 @@ def translate_segments(segments, lang_code, lang_name, check_cancel=None):
                     temperature=0.2,
                 )
                 translated_text = (response.choices[0].message.content or "").strip()
+                openrouter_errors = 0
             except Exception as exc:
+                openrouter_errors += 1
                 print(f"OpenRouter translation failed for a segment; trying Google Translate: {exc}")
-                # Avoid repeatedly making failing API calls on every remaining segment.
-                client = None
+                if openrouter_errors >= 3:
+                    print("Disabling OpenRouter after 3 consecutive errors; using Google Translate.")
+                    client = None
 
         if source_text and not translated_text:
             try:
@@ -355,8 +346,11 @@ def _run_async(coro):
 
 
 def generate_tts_audio(segments, lang_code, duration, out_path, check_cancel=None):
-    total_ms   = int(duration * 1000) + 500
-    combined   = AudioSegment.silent(duration=total_ms)
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise RuntimeError("FFmpeg and FFprobe must be installed and available in PATH for dubbed audio.")
+
+    total_ms = int(duration * 1000) + 500
+    combined = AudioSegment.empty()
     text_segments = 0
     clips_added = 0
 
@@ -373,9 +367,6 @@ def generate_tts_audio(segments, lang_code, duration, out_path, check_cancel=Non
         if not text:
             continue
         text_segments += 1
-
-        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-            raise RuntimeError("FFmpeg and FFprobe must be installed and available in PATH for dubbed audio.")
 
         # Create a temp file for edge-tts output
         tmp_fd, tmp_mp3 = tempfile.mkstemp(suffix=".mp3", prefix="translytic_tts_seg_")
@@ -401,6 +392,8 @@ def generate_tts_audio(segments, lang_code, duration, out_path, check_cancel=Non
         if len(clip) > remaining_ms:
             clip = clip[:remaining_ms]
 
+        if len(combined) < start_ms:
+            combined += AudioSegment.silent(duration=start_ms - len(combined))
         combined = combined.overlay(clip, position=start_ms)
         clips_added += 1
 
@@ -408,6 +401,9 @@ def generate_tts_audio(segments, lang_code, duration, out_path, check_cancel=Non
         raise RuntimeError("No translated speech segments were available for dubbed audio.")
     if clips_added == 0:
         raise RuntimeError("No dubbed audio segments could be generated.")
+
+    if len(combined) < total_ms:
+        combined += AudioSegment.silent(duration=total_ms - len(combined))
 
     combined.export(out_path, format="wav")
     return out_path
@@ -679,8 +675,8 @@ class CaptionApp:
             font=FONT_BTN, relief="flat", bd=0, padx=18, pady=6,
             cursor="hand2", highlightthickness=0
         )
-        btn.bind("<Enter>", lambda e: btn.config(bg=hbg, fg=hfg))
-        btn.bind("<Leave>", lambda e: btn.config(bg=bg,  fg=fg))
+        btn.bind("<Enter>", lambda e: btn.config(bg=hbg, fg=hfg) if str(btn["state"]) != "disabled" else None)
+        btn.bind("<Leave>", lambda e: btn.config(bg=bg,  fg=fg)  if str(btn["state"]) != "disabled" else None)
         return btn
 
     def _style_widgets(self):
@@ -1085,9 +1081,13 @@ class CaptionApp:
             audio = extract_audio(video_path, out=audio_path)
 
             if check_cancel(): raise InterruptedError("Cancelled")
-            with VideoFileClip(video_path) as clip:
-                self._duration = clip.duration
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            cap.release()
+            self._duration = total_frames / fps if fps > 0 else 0.0
 
+            if check_cancel(): raise InterruptedError("Cancelled")
             self._set_status("Transcribing…", ACCENT)
             self._set_prog("Step 2 / 4")
             self._log("Step 2/4 — Running Whisper…")
@@ -1413,20 +1413,21 @@ class CaptionApp:
             fg=ACCENT if self._use_tts else ACCENT2,
         )
 
+        active_audio = (
+            self._tts_audio_path if self._use_tts else self._audio_path
+        )
+        if not active_audio or not os.path.exists(active_audio):
+            self._use_tts = old_mode
+            label = "🗣  Dubbed" if self._use_tts else "🔊  Original"
+            self.tts_btn.config(
+                text=label,
+                fg=ACCENT if self._use_tts else ACCENT2,
+            )
+            messagebox.showerror("Playback error", "Processed audio is missing. Process the video again.")
+            return
+
         if self._playing:
             t = time.time() - self._play_start_wall
-            active_audio = (
-                self._tts_audio_path if self._use_tts else self._audio_path
-            )
-            if not active_audio or not os.path.exists(active_audio):
-                self._use_tts = old_mode
-                label = "🗣  Dubbed" if self._use_tts else "🔊  Original"
-                self.tts_btn.config(
-                    text=label,
-                    fg=ACCENT if self._use_tts else ACCENT2,
-                )
-                messagebox.showerror("Playback error", "Processed audio is missing. Process the video again.")
-                return
             try:
                 pygame.mixer.music.stop()
                 pygame.mixer.music.load(active_audio)
@@ -1454,6 +1455,22 @@ class CaptionApp:
                     self._playing = False
                     self._paused = False
                     self.play_pause_btn.config(text="▶  Play")
+                messagebox.showerror("Playback error", str(e))
+        elif self._paused:
+            try:
+                pygame.mixer.music.stop()
+                pygame.mixer.music.load(active_audio)
+                pygame.mixer.music.play(start=self._pause_offset)
+                pygame.mixer.music.pause()
+                mode = "🗣  Dubbed" if self._use_tts else "🔉  Original"
+                self._set_status(f"Paused ({mode})", WARN)
+            except Exception as e:
+                self._use_tts = old_mode
+                label = "🗣  Dubbed" if self._use_tts else "🔊  Original"
+                self.tts_btn.config(
+                    text=label,
+                    fg=ACCENT if self._use_tts else ACCENT2,
+                )
                 messagebox.showerror("Playback error", str(e))
 
     def _export_srt(self):

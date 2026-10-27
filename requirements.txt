@@ -4,7 +4,6 @@ opencv-python
 Pillow
 openai-whisper
 deep-translator
-moviepy>=2.0
 tkinterdnd2
 openai
 edge-tts

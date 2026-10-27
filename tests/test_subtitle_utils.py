@@ -32,6 +32,9 @@ class SubtitleUtilsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             to_srt([{"start": 2, "end": 1, "text": "bad"}])
 
+    def test_srt_empty_list(self):
+        self.assertEqual(to_srt([]), "")
+
     def test_caption_lookup(self):
         segments = [
             {"start": 0, "end": 1, "text": "first"},
@@ -40,6 +43,8 @@ class SubtitleUtilsTests(unittest.TestCase):
         self.assertEqual(get_caption_at(segments, 0.5), "first")
         self.assertEqual(get_caption_at(segments, 2.5), "second")
         self.assertEqual(get_caption_at(segments, 1.5), "")
+        self.assertEqual(get_caption_at(segments, 4.0), "")
+        self.assertEqual(get_caption_at([], 0.5), "")
 
 
 if __name__ == "__main__":
