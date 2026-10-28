@@ -1,6 +1,4 @@
-# Translytic — Live Video Player with Translated Captions + Video Preview
-# Modernized UI: gradients, fullscreen-optimized layout, perfectly synced A/V
-# -----------------------------------------------------------------------
+
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -15,8 +13,11 @@ import tempfile
 import importlib.util
 import queue
 import subprocess
+import json
 
 warnings.filterwarnings("ignore")
+
+LOGGER = logging.getLogger("translytic")
 
 # ── DPI Awareness Fix (Windows) ─────────────────────────────
 try:
@@ -43,27 +44,64 @@ REQUIRED_IMPORTS = {
 }
 _missing = [package for package, module in REQUIRED_IMPORTS.items()
             if importlib.util.find_spec(module) is None]
-if _missing:
-    raise SystemExit(
-        "Translytic is missing required Python packages: " + ", ".join(_missing) +
-        "\nActivate your virtual environment and run: pip install -r requirements.txt"
-    )
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
+
 load_dotenv()  # Reads an optional local .env file; never commit that file.
 
-import pygame
-import cv2
-from PIL import Image, ImageTk, ImageDraw
-import whisper
-from deep_translator import GoogleTranslator
-from tkinterdnd2 import DND_FILES, TkinterDnD
-import edge_tts
+try:
+    import pygame
+except ImportError:
+    pygame = None
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+try:
+    from PIL import Image, ImageTk, ImageDraw
+except ImportError:
+    Image = ImageTk = ImageDraw = None
+try:
+    import whisper
+except ImportError:
+    whisper = None
+try:
+    from deep_translator import GoogleTranslator
+except ImportError:
+    GoogleTranslator = None
+try:
+    from deep_translator import MyMemoryTranslator
+except ImportError:
+    MyMemoryTranslator = None
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    DND_FILES = TkinterDnD = None
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
 import asyncio
-from pydub import AudioSegment
+try:
+    from pydub import AudioSegment
+except ImportError:
+    AudioSegment = None
 from subtitle_utils import format_time, to_srt, get_caption_at
 
 # ── FFmpeg availability check ────────────────────────────────
+def require_runtime_dependencies():
+    """Raise a useful startup error without preventing unit-test imports."""
+    if _missing:
+        raise RuntimeError(
+            "Translytic is missing required Python packages: " + ", ".join(_missing) +
+            "\nActivate the virtual environment and run: pip install -r requirements.txt"
+        )
+
+
 def ensure_ffmpeg_available():
     if shutil.which("ffmpeg") and shutil.which("ffprobe"):
         return
@@ -88,6 +126,11 @@ def ensure_ffmpeg_available():
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip() or "openrouter/free"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+_google_translate_lock = threading.Lock()
+_google_translate_next_request = 0.0
+GOOGLE_TRANSLATE_MIN_INTERVAL = 0.35
+GOOGLE_TRANSLATE_RATE_LIMIT_RETRIES = 2
 
 # ── Colour palette ───────────────────────────────────────────
 BG          = "#06060e"
@@ -128,16 +171,21 @@ VIDEO_W     = 1600
 VIDEO_H     = 900
 
 LANGUAGES = {
-    "English":              "en",
     "Hindi":                "hi",
     "Marathi":              "mr",
-    "Spanish":              "es",
-    "French":               "fr",
-    "German":               "de",
-    "Japanese":             "ja",
-    "Chinese (Simplified)": "zh-CN",
-    "Arabic":               "ar",
-    "Portuguese":           "pt",
+}
+
+TRANSLATION_LANGUAGE_NAMES = {
+    "en": "english",
+    "hi": "hindi",
+    "mr": "marathi",
+    "es": "spanish",
+    "fr": "french",
+    "de": "german",
+    "ja": "japanese",
+    "zh-CN": "chinese simplified",
+    "ar": "arabic",
+    "pt": "portuguese",
 }
 
 # ── Gradient helpers ─────────────────────────────────────────
@@ -188,6 +236,7 @@ class GradientFrame(tk.Canvas):
 # ── Utility functions ────────────────────────────────────────
 
 def extract_audio(video_path, out="audio_temp.wav"):
+    LOGGER.info("Audio extraction started: %s", video_path)
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
         "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", out
@@ -197,6 +246,11 @@ def extract_audio(video_path, out="audio_temp.wav"):
         if "does not contain any stream" in res.stderr or "Output file does not contain any stream" in res.stderr:
             raise ValueError("This video does not have an audio track.")
         raise RuntimeError(f"FFmpeg audio extraction failed: {res.stderr.strip()[-200:]}")
+    metadata = probe_audio_file(out)
+    LOGGER.info(
+        "Audio extraction completed: %s bytes, %.2fs",
+        metadata["size"], metadata["duration"],
+    )
     return out
 
 _whisper_model = None
@@ -204,11 +258,14 @@ _whisper_device = None
 
 def transcribe(audio_path):
     global _whisper_model, _whisper_device
+    if whisper is None:
+        raise RuntimeError("OpenAI Whisper is not installed. Run: pip install -r requirements.txt")
     if _whisper_model is None:
         import torch
         _whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
         _whisper_model = whisper.load_model("small", device=_whisper_device)
     result = _whisper_model.transcribe(audio_path)
+    source_language = str(result.get("language", "")).strip().lower()
     segments = []
     for seg in result["segments"]:
         segments.append({
@@ -218,15 +275,80 @@ def transcribe(audio_path):
             "avg_logprob":    seg.get("avg_logprob", 0),
             "no_speech_prob": seg.get("no_speech_prob", 0),
             "confidence":     round(min(1.0, max(0.0, 1.0 + seg.get("avg_logprob", 0))) * 100, 1),
+            "source_language": source_language,
         })
     return segments
+
+
+def _is_google_rate_limit_error(exc):
+    message = str(exc).lower()
+    return (
+        "too many requests" in message
+        or "429" in message
+        or "rate limit" in message
+        or "ratelimit" in message
+    )
+
+
+def _google_translate_with_retry(source_text, lang_code):
+    """Translate with pacing and bounded retries for Google's 429 response."""
+    global _google_translate_next_request
+    if GoogleTranslator is None:
+        raise RuntimeError("deep-translator is not installed.")
+
+    for attempt in range(GOOGLE_TRANSLATE_RATE_LIMIT_RETRIES + 1):
+        with _google_translate_lock:
+            wait_for = _google_translate_next_request - time.monotonic()
+            if wait_for > 0:
+                time.sleep(wait_for)
+            _google_translate_next_request = (
+                time.monotonic() + GOOGLE_TRANSLATE_MIN_INTERVAL
+            )
+            try:
+                translated = GoogleTranslator(
+                    source="auto", target=lang_code
+                ).translate(source_text) or ""
+                translated = translated.strip()
+                if not translated:
+                    raise RuntimeError("Google Translate returned empty text.")
+                return translated
+            except Exception as exc:
+                if not _is_google_rate_limit_error(exc) or attempt >= GOOGLE_TRANSLATE_RATE_LIMIT_RETRIES:
+                    raise
+                delay = 1.0 * (attempt + 1)
+                LOGGER.warning(
+                    "Google Translate rate-limited; retrying in %.1fs (%d/%d).",
+                    delay, attempt + 1, GOOGLE_TRANSLATE_RATE_LIMIT_RETRIES,
+                )
+        time.sleep(delay)
+    return ""
+
+
+def _mymemory_translate(source_text, source_language, target_language):
+    """Use deep-translator's free MyMemory backend after Google throttling."""
+    if MyMemoryTranslator is None:
+        raise RuntimeError("The MyMemory fallback is not available in deep-translator.")
+    source_code = {"zh": "zh-CN"}.get(source_language, source_language)
+    source_name = TRANSLATION_LANGUAGE_NAMES.get(source_code)
+    target_name = TRANSLATION_LANGUAGE_NAMES.get(target_language)
+    if not source_name or not target_name:
+        raise RuntimeError(
+            f"MyMemory fallback does not have a language mapping for "
+            f"{source_language!r} → {target_language!r}."
+        )
+    translated = MyMemoryTranslator(
+        source=source_name, target=target_name
+    ).translate(source_text) or ""
+    return translated.strip()
 
 def translate_segments(segments, lang_code, lang_name, check_cancel=None):
     """Translate segments and retain explicit failure metadata for failed lines.
 
     OpenRouter is optional and uses the OpenAI-compatible chat completions API.
     When it is unavailable or a request fails, Google Translate is attempted per
-    segment. If both fail, the source text is retained and marked as failed.
+    segment. If Google is unavailable and Whisper identified the source
+    language, the free MyMemory backend is attempted. If all providers fail,
+    the source text is retained and marked as failed.
     """
     client = None
     openrouter_errors = 0
@@ -244,11 +366,13 @@ def translate_segments(segments, lang_code, lang_name, check_cancel=None):
             print(f"OpenRouter translation is unavailable; using Google Translate: {exc}")
 
     out = []
+    translation_cache = {}
     for seg in segments:
         if check_cancel and check_cancel():
             raise InterruptedError("Cancelled")
 
         source_text = str(seg.get("text", "")).strip()
+        source_language = str(seg.get("source_language", "")).strip().lower()
         translated_text = ""
         translation_failed = False
         translation_error = ""
@@ -277,13 +401,40 @@ def translate_segments(segments, lang_code, lang_name, check_cancel=None):
 
         if source_text and not translated_text:
             try:
-                translated_text = GoogleTranslator(
-                    source="auto", target=lang_code
-                ).translate(source_text) or ""
-                translated_text = translated_text.strip()
+                if GoogleTranslator is None:
+                    raise RuntimeError(
+                        "deep-translator is not installed and OpenRouter did not return a translation."
+                    )
+                cache_key = (lang_code, source_text)
+                if cache_key not in translation_cache:
+                    translation_cache[cache_key] = _google_translate_with_retry(
+                        source_text, lang_code
+                    )
+                translated_text = translation_cache[cache_key]
             except Exception as exc:
                 translation_error = str(exc)
                 print(f"Google Translate failed for a segment: {exc}")
+                if source_language:
+                    try:
+                        fallback_key = (
+                            "mymemory", source_language, lang_code, source_text
+                        )
+                        if fallback_key not in translation_cache:
+                            translation_cache[fallback_key] = _mymemory_translate(
+                                source_text, source_language, lang_code
+                            )
+                        translated_text = translation_cache[fallback_key]
+                        if translated_text:
+                            LOGGER.warning(
+                                "Used MyMemory fallback for %s → %s.",
+                                source_language, lang_code,
+                            )
+                            translation_error = ""
+                    except Exception as fallback_exc:
+                        translation_error = (
+                            f"Google Translate: {translation_error}; "
+                            f"MyMemory fallback: {fallback_exc}"
+                        )
 
         if source_text and not translated_text:
             translated_text = source_text
@@ -313,7 +464,10 @@ def remove_file_silent(path):
         return False
 
 
-# ── Edge-TTS voice mapping ───────────────────────────────────
+# ── Edge-TTS voice and audio pipeline ─────────────────────────
+# These are preferences, not an unchecked allow-list. Edge TTS exposes the
+# current voice catalog at runtime, so every preferred name is validated before
+# it is used. This avoids silently sending Marathi/Arabic/etc. text to English.
 EDGE_TTS_VOICES = {
     "en":    "en-US-AriaNeural",
     "hi":    "hi-IN-SwaraNeural",
@@ -327,85 +481,299 @@ EDGE_TTS_VOICES = {
     "pt":    "pt-BR-FranciscaNeural",
 }
 
+EDGE_TTS_LOCALES = {
+    "en": "en-US", "hi": "hi-IN", "mr": "mr-IN", "es": "es-ES",
+    "fr": "fr-FR", "de": "de-DE", "ja": "ja-JP", "zh-CN": "zh-CN",
+    "ar": "ar-SA", "pt": "pt-BR",
+}
+
+
+def _voice_field(voice, field, default=""):
+    if isinstance(voice, dict):
+        return str(voice.get(field, default) or default)
+    return str(getattr(voice, field, default) or default)
+
+
+def _voice_name(voice):
+    """Read both edge-tts dict records and test-friendly objects."""
+    return _voice_field(voice, "ShortName") or _voice_field(voice, "Name")
+
+
+def _voice_locale(voice):
+    locale = _voice_field(voice, "Locale").replace("_", "-")
+    if locale:
+        return locale
+    name = _voice_name(voice)
+    return "-".join(name.split("-")[:2])
+
+
+def resolve_tts_voice(lang_code, available_voices):
+    """Resolve a voice only from the provider's current voice catalog."""
+    target_locale = EDGE_TTS_LOCALES.get(lang_code, lang_code).replace("_", "-")
+    target_root = target_locale.split("-", 1)[0].lower()
+    voices = [voice for voice in (available_voices or []) if _voice_name(voice)]
+    if not voices:
+        raise RuntimeError("Edge TTS returned no available voices.")
+
+    by_name = {_voice_name(voice).casefold(): _voice_name(voice) for voice in voices}
+    preferred = EDGE_TTS_VOICES.get(lang_code)
+    if preferred and preferred.casefold() in by_name:
+        return by_name[preferred.casefold()]
+
+    exact = [voice for voice in voices if _voice_locale(voice).casefold() == target_locale.casefold()]
+    if exact:
+        return _voice_name(exact[0])
+    same_language = [
+        voice for voice in voices
+        if _voice_locale(voice).split("-", 1)[0].lower() == target_root
+    ]
+    if same_language:
+        return _voice_name(same_language[0])
+    raise RuntimeError(
+        f"Edge TTS has no voice for target language '{lang_code}' ({target_locale})."
+    )
+
+
+def probe_audio_file(path):
+    """Validate an audio file with ffprobe and return basic metadata."""
+    if not path or not os.path.isfile(path):
+        raise RuntimeError(f"Generated audio file is missing: {path}")
+    size = os.path.getsize(path)
+    if size <= 0:
+        raise RuntimeError(f"Generated audio file is empty: {path}")
+    if not shutil.which("ffprobe"):
+        raise RuntimeError("FFprobe is required to validate generated audio.")
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries",
+        "format=duration:stream=codec_name,codec_type,sample_rate,channels",
+        "-of", "json", path,
+    ]
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", errors="replace", timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"FFprobe could not read audio '{path}': {result.stderr.strip()[-400:]}")
+    try:
+        metadata = json.loads(result.stdout or "{}")
+        duration = float(metadata.get("format", {}).get("duration") or 0)
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"FFprobe returned invalid metadata for '{path}'.") from exc
+    if duration <= 0:
+        raise RuntimeError(f"Audio file has no positive duration: {path}")
+    metadata["size"] = size
+    metadata["duration"] = duration
+    return metadata
+
+
+def select_playback_audio(original_path, dubbed_path, use_dubbed):
+    """Return the currently selectable track without inventing a fallback path."""
+    if use_dubbed and dubbed_path:
+        return dubbed_path
+    return original_path
+
 
 async def _edge_tts_synthesize(text, voice, out_file):
-    """Synthesize a single text segment to an mp3 file using edge-tts."""
-    communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(out_file)
+    """Synthesize one segment to MP3 using edge-tts."""
+    if edge_tts is None:
+        raise RuntimeError("edge-tts is not installed. Run: pip install -r requirements.txt")
+    await edge_tts.Communicate(text, voice).save(out_file)
+
+
+async def _edge_tts_list_voices(timeout):
+    return await asyncio.wait_for(edge_tts.list_voices(), timeout=timeout)
 
 
 def _run_async(coro):
-    """Run an async coroutine safely, handling Windows event-loop policy."""
-    if sys.platform == "win32":
+    """Run a coroutine in the worker thread with a clean event loop."""
+    if sys.platform == "win32" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(coro)
     finally:
-        loop.close()
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
 
 
-def generate_tts_audio(segments, lang_code, duration, out_path, check_cancel=None):
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        raise RuntimeError("FFmpeg and FFprobe must be installed and available in PATH for dubbed audio.")
+def _tts_log(message, log_callback=None, level=logging.INFO):
+    LOGGER.log(level, message)
+    if log_callback:
+        log_callback(message)
 
-    total_ms = int(duration * 1000) + 500
-    combined = AudioSegment.empty()
-    text_segments = 0
-    clips_added = 0
 
-    voice = EDGE_TTS_VOICES.get(lang_code, "en-US-AriaNeural")
+async def _synthesize_with_retry(text, voice, out_file, timeout, max_retries, log_callback=None):
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            # A timed-out provider call may have left a partial file behind.
+            remove_file_silent(out_file)
+            await asyncio.wait_for(_edge_tts_synthesize(text, voice, out_file), timeout=timeout)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_retries:
+                _tts_log(
+                    f"TTS retry {attempt + 1}/{max_retries} after: {exc}",
+                    log_callback, logging.WARNING,
+                )
+                await asyncio.sleep(min(2 ** attempt, 4))
+    raise RuntimeError(
+        f"TTS request failed after {max_retries + 1} attempts: {last_error}"
+    ) from last_error
 
-    for i, seg in enumerate(segments):
+
+async def _synthesize_segments(requests, voice, timeout, max_retries, check_cancel, log_callback):
+    for request in requests:
         if check_cancel and check_cancel():
             raise InterruptedError("Cancelled")
-
-        # Avoid speaking source-language text as if it were a successful translation.
-        if seg.get("translation_failed"):
-            continue
-        text = seg["text"].strip()
-        if not text:
-            continue
-        text_segments += 1
-
-        # Create a temp file for edge-tts output
-        tmp_fd, tmp_mp3 = tempfile.mkstemp(suffix=".mp3", prefix="translytic_tts_seg_")
-        os.close(tmp_fd)
-
+        _tts_log(
+            f"TTS request started: segment {request['index']} voice={voice}", log_callback
+        )
         try:
-            _run_async(_edge_tts_synthesize(text, voice, tmp_mp3))
-            clip = AudioSegment.from_file(tmp_mp3, format="mp3")
-        except Exception as e:
-            print(f"TTS failed for segment {i}: {e}")
+            await _synthesize_with_retry(
+                request["text"], voice, request["path"], timeout, max_retries, log_callback
+            )
+            _tts_log(f"TTS request completed: segment {request['index']}", log_callback)
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            request["error"] = str(exc)
+            _tts_log(
+                f"TTS request failed: segment {request['index']}: {exc}",
+                log_callback, logging.ERROR,
+            )
+
+
+def _fit_clip_to_slot(clip, slot_ms, log_callback=None):
+    """Prefer modest speed-up to cutting words when a clip is too long."""
+    if slot_ms <= 0 or len(clip) <= slot_ms:
+        return clip
+    try:
+        factor = min(1.5, max(1.01, len(clip) / slot_ms))
+        fitted = clip.speedup(playback_speed=factor, chunk_size=50, crossfade=10)
+        if len(fitted) <= slot_ms:
+            return fitted
+    except Exception as exc:
+        _tts_log(f"Could not time-compress a long segment: {exc}", log_callback, logging.WARNING)
+    _tts_log(
+        f"Speech still exceeds its {slot_ms} ms slot; truncating the tail.",
+        log_callback, logging.WARNING,
+    )
+    return clip[:slot_ms]
+
+
+def generate_tts_audio(
+    segments, lang_code, duration, out_path, check_cancel=None,
+    available_voices=None, timeout=45, max_retries=2, log_callback=None,
+):
+    """Generate one validated, timeline-aligned WAV dubbed track."""
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise RuntimeError("FFmpeg and FFprobe must be installed and available in PATH for dubbed audio.")
+    if AudioSegment is None:
+        raise RuntimeError("pydub is not installed. Run: pip install -r requirements.txt")
+    if edge_tts is None:
+        raise RuntimeError("edge-tts is not installed. Run: pip install -r requirements.txt")
+
+    if available_voices is None:
+        _tts_log("Fetching current Edge TTS voice catalog…", log_callback)
+        available_voices = _run_async(_edge_tts_list_voices(timeout))
+    voice = resolve_tts_voice(lang_code, available_voices)
+    _tts_log(f"Target language={lang_code}; selected voice={voice}", log_callback)
+
+    eligible = []
+    failed_translation_errors = []
+    for index, segment in enumerate(segments):
+        if check_cancel and check_cancel():
+            raise InterruptedError("Cancelled")
+        if segment.get("translation_failed"):
+            if segment.get("translation_error"):
+                failed_translation_errors.append(str(segment["translation_error"]))
             continue
-        finally:
-            remove_file_silent(tmp_mp3)
-
-        start_ms = int(seg["start"] * 1000)
-        seg_duration_ms = int((seg["end"] - seg["start"]) * 1000)
-        if len(clip) > seg_duration_ms + 200:
-            clip = clip[:seg_duration_ms + 200]
-
-        remaining_ms = total_ms - start_ms
-        if remaining_ms <= 0:
-            continue
-        if len(clip) > remaining_ms:
-            clip = clip[:remaining_ms]
-
-        if len(combined) < start_ms:
-            combined += AudioSegment.silent(duration=start_ms - len(combined))
-        combined = combined.overlay(clip, position=start_ms)
-        clips_added += 1
-
-    if text_segments == 0:
+        text = str(segment.get("text", "")).strip()
+        if text:
+            eligible.append((index, segment, text))
+    if not eligible:
+        if failed_translation_errors:
+            detail = failed_translation_errors[0]
+            raise RuntimeError(
+                f"No translated speech segments were available for dubbed audio. "
+                f"{len(failed_translation_errors)} segment(s) failed translation; "
+                f"first error: {detail}"
+            )
         raise RuntimeError("No translated speech segments were available for dubbed audio.")
-    if clips_added == 0:
-        raise RuntimeError("No dubbed audio segments could be generated.")
 
-    if len(combined) < total_ms:
-        combined += AudioSegment.silent(duration=total_ms - len(combined))
+    total_ms = max(1, int(float(duration) * 1000) + 500)
+    with tempfile.TemporaryDirectory(prefix="translytic_tts_") as work_dir:
+        requests = []
+        paths_by_text = {}
+        for index, segment, text in eligible:
+            path = paths_by_text.get(text)
+            if path is None:
+                path = os.path.join(work_dir, f"segment_{len(paths_by_text):05d}.mp3")
+                paths_by_text[text] = path
+                requests.append({"index": index, "text": text, "path": path})
+        _run_async(_synthesize_segments(
+            requests, voice, timeout, max_retries, check_cancel, log_callback
+        ))
 
-    combined.export(out_path, format="wav")
+        clip_cache = {}
+        successful_requests = [request for request in requests if not request.get("error")]
+        for request in successful_requests:
+            try:
+                metadata = probe_audio_file(request["path"])
+                _tts_log(
+                    f"Generated audio: {request['path']} size={metadata['size']} bytes "
+                    f"duration={metadata['duration']:.2f}s", log_callback,
+                )
+                clip_cache[request["text"]] = AudioSegment.from_file(
+                    request["path"], format="mp3"
+                )
+            except Exception as exc:
+                request["error"] = str(exc)
+                _tts_log(
+                    f"Generated audio is invalid for segment {request['index']}: {exc}",
+                    log_callback, logging.ERROR,
+                )
+
+        if not clip_cache:
+            raise RuntimeError("No dubbed audio segments could be generated.")
+
+        combined = AudioSegment.silent(duration=total_ms, frame_rate=44100)
+        combined = combined.set_channels(2).set_sample_width(2)
+        clips_added = 0
+        for position, (index, segment, text) in enumerate(eligible):
+            if text not in clip_cache:
+                continue
+            start_ms = max(0, int(float(segment.get("start", 0)) * 1000))
+            if start_ms >= total_ms:
+                continue
+            next_start_ms = total_ms
+            for _, next_segment, _ in eligible[position + 1:]:
+                candidate = int(float(next_segment.get("start", duration)) * 1000)
+                if candidate > start_ms:
+                    next_start_ms = min(total_ms, candidate)
+                    break
+            clip = clip_cache[text].set_frame_rate(44100).set_channels(2).set_sample_width(2)
+            clip = _fit_clip_to_slot(clip, max(1, next_start_ms - start_ms), log_callback)
+            clip = clip[:total_ms - start_ms]
+            combined = combined.overlay(clip, position=start_ms)
+            clips_added += 1
+        if clips_added == 0:
+            raise RuntimeError("No dubbed audio segments could be placed on the timeline.")
+        combined.export(out_path, format="wav")
+
+    metadata = probe_audio_file(out_path)
+    _tts_log(
+        f"Final dubbed audio: {out_path} size={metadata['size']} bytes "
+        f"duration={metadata['duration']:.2f}s", log_callback,
+    )
     return out_path
 
 
@@ -413,6 +781,7 @@ def generate_tts_audio(segments, lang_code, duration, out_path, check_cancel=Non
 
 class CaptionApp:
     def __init__(self, root):
+        require_runtime_dependencies()
         self.root = root
         self.root.title("Translytic — Live Translated Player")
         self.root.geometry("1280x800")
@@ -1029,7 +1398,7 @@ class CaptionApp:
 
         video_path = self.video_path
         lang_name = self.lang_var.get()
-        lang_code = LANGUAGES.get(lang_name, "en")
+        lang_code = LANGUAGES.get(lang_name, "hi")
 
         self._stop()
         self._delete_owned_temp_file(self._audio_path)
@@ -1056,6 +1425,7 @@ class CaptionApp:
         os.close(audio_fd)
         self._track_temp_file(audio_path)
         tts_path = None
+        tts_error = None
 
         def check_cancel():
             return self._cancel_processing
@@ -1145,17 +1515,20 @@ class CaptionApp:
             try:
                 generate_tts_audio(
                     translated_segments, lang_code,
-                    self._duration, tts_path, check_cancel
+                    self._duration, tts_path, check_cancel,
+                    log_callback=self._log,
                 )
                 self._tts_audio_path = tts_path
                 tts_path = None
+                self._use_tts = True
                 self._log(f"✓  Dubbed audio ready.")
                 self._schedule_ui(0, lambda: self.tts_btn.config(
-                    text="🔊  Original", fg=ACCENT2, state="normal"))
+                    text="🗣  Dubbed", fg=ACCENT, state="normal"))
             except InterruptedError:
                 raise
             except Exception as e:
-                self._log(f"TTS generation failed (captions still work): {e}")
+                tts_error = str(e)
+                self._log(f"TTS generation failed (captions still work): {tts_error}")
                 self._delete_owned_temp_file(tts_path)
                 tts_path = None
                 self._tts_audio_path = None
@@ -1163,8 +1536,22 @@ class CaptionApp:
                 self._schedule_ui(0, lambda: self.tts_btn.config(
                     text="🔊  Original", fg=ACCENT2, state="disabled"))
 
-            self._set_status(f"Ready — {n} captions", SUCCESS)
-            self._log(f"✓  Done! {n} captions ready. Playing…")
+            if tts_error:
+                self._schedule_ui(
+                    0,
+                    lambda err=tts_error: messagebox.showwarning(
+                        "Dubbed audio unavailable",
+                        "Captions are ready, but translated audio could not be generated.\n\n"
+                        + err,
+                    ),
+                )
+                self._set_status(f"Ready — {n} captions (original audio)", WARN)
+            else:
+                self._set_status(f"Ready — {n} captions + dubbed audio", SUCCESS)
+            if tts_error:
+                self._log(f"✓  Done! {n} captions ready. Playing original audio…")
+            else:
+                self._log(f"✓  Done! {n} captions and dubbed audio ready. Playing…")
 
             self._schedule_ui(0, lambda: [
                 self.seekbar.config(to=self._duration),
@@ -1199,10 +1586,8 @@ class CaptionApp:
             messagebox.showwarning("Not ready", "Process the video first.")
             return
 
-        active_audio = (
-            self._tts_audio_path
-            if self._use_tts and self._tts_audio_path
-            else self._audio_path
+        active_audio = select_playback_audio(
+            self._audio_path, self._tts_audio_path, self._use_tts
         )
         if not active_audio or not os.path.exists(active_audio):
             messagebox.showerror("Playback error", "Processed audio is missing. Process the video again.")
@@ -1335,10 +1720,8 @@ class CaptionApp:
         t = float(val)
         t = max(0, min(t, self._duration - 0.1))  # clamp to valid range
         if self._playing or self._paused:
-            active_audio = (
-                self._tts_audio_path
-                if self._use_tts and self._tts_audio_path
-                else self._audio_path
+            active_audio = select_playback_audio(
+                self._audio_path, self._tts_audio_path, self._use_tts
             )
             if not active_audio or not os.path.exists(active_audio):
                 messagebox.showerror("Playback error", "Processed audio is missing. Process the video again.")
@@ -1413,8 +1796,8 @@ class CaptionApp:
             fg=ACCENT if self._use_tts else ACCENT2,
         )
 
-        active_audio = (
-            self._tts_audio_path if self._use_tts else self._audio_path
+        active_audio = select_playback_audio(
+            self._audio_path, self._tts_audio_path, self._use_tts
         )
         if not active_audio or not os.path.exists(active_audio):
             self._use_tts = old_mode
@@ -1514,6 +1897,7 @@ class CaptionApp:
 # ── Entry point ──────────────────────────────────────────────
 
 if __name__ == "__main__":
+    require_runtime_dependencies()
     ensure_ffmpeg_available()
     root = TkinterDnD.Tk()
     root.option_add("*tearOff", False)
